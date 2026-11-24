@@ -10,14 +10,25 @@
 
 // ---------------------------------------------------------------- text rules
 
-const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const ESCAPE_RE = /[&<>"']/g;
-
 /** `s` with & < > " ' escaped; returns `s` itself when there is nothing to escape. */
 function escapeHtml(s) {
-  ESCAPE_RE.lastIndex = 0;
-  if (!ESCAPE_RE.test(s)) return s;
-  return s.replace(/[&<>"']/g, (c) => ESCAPES[c]);
+  let out = null;
+  let last = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    let e = null;
+    if (c === 38) e = '&amp;';
+    else if (c === 60) e = '&lt;';
+    else if (c === 62) e = '&gt;';
+    else if (c === 34) e = '&quot;';
+    else if (c === 39) e = '&#39;';
+    if (e === null) continue;
+    out = out === null ? s.slice(0, i) : out + s.slice(last, i);
+    out += e;
+    last = i + 1;
+  }
+  if (out === null) return s;
+  return last < s.length ? out + s.slice(last) : out;
 }
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
@@ -27,9 +38,11 @@ function longDate(date) {
   return `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
 }
 
+const MARKS_RE = /\p{M}/gu;
+
 /** The slug of `text`, before memoisation: NFKD, marks dropped, lowered, runs of other characters one "-". */
 function slugifyRaw(text) {
-  const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+  const plain = text.normalize('NFKD').replace(MARKS_RE, '');
   let out = '';
   let gap = false;
   for (const ch of plain) {
@@ -189,22 +202,33 @@ function fmValue(key, raw) {
 
 /**
  * A source's front matter and body: { data, body }, or { error } with the first reason it is
- * refused. `text` has "\n" line ends.
+ * refused. `text` has "\n" line ends. Only the head of the text is scanned line by line (the
+ * front matter is a handful of lines); the body is one slice of what follows the closing line.
  */
 function parseFrontMatter(text) {
-  const lines = text.split('\n');
-  if (lines[0] !== '---') return { error: 'no front matter' };
-  let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') {
-      close = i;
+  if (text.charCodeAt(0) !== 45 || text.charCodeAt(1) !== 45 || text.charCodeAt(2) !== 45 || (text.length > 3 && text.charCodeAt(3) !== 10)) {
+    return { error: 'no front matter' };
+  }
+  if (text.length === 3) return { error: 'the front matter is not closed' };
+  const fmLines = [];
+  let bodyStart = -1;
+  let pos = 4;
+  for (;;) {
+    const nl = text.indexOf('\n', pos);
+    const lineEnd = nl === -1 ? text.length : nl;
+    if (lineEnd - pos === 3 && text.charCodeAt(pos) === 45 && text.charCodeAt(pos + 1) === 45 && text.charCodeAt(pos + 2) === 45) {
+      bodyStart = nl === -1 ? text.length : nl + 1;
       break;
     }
+    fmLines.push(text.slice(pos, lineEnd));
+    if (nl === -1) break;
+    pos = nl + 1;
   }
-  if (close === -1) return { error: 'the front matter is not closed' };
+  if (bodyStart === -1) return { error: 'the front matter is not closed' };
   const data = {};
-  for (let i = 1; i < close; i++) {
-    const line = lines[i];
+  for (let idx = 0; idx < fmLines.length; idx++) {
+    const i = idx + 1; // the line's index counting the opening "---" as line 0
+    const line = fmLines[idx];
     if (isBlankST(line) || line.charCodeAt(0) === 35) continue;
     // "key: value": a key of a-z and "_", a colon, then either the end or one space and the value.
     let k = 0;
@@ -228,7 +252,7 @@ function parseFrontMatter(text) {
     data[key] = v.value;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  return { data, body: lines.slice(close + 1).join('\n') };
+  return { data, body: text.slice(bodyStart) };
 }
 
 /** `s` with trailing spaces and tabs dropped. */
@@ -362,79 +386,92 @@ function findSingleStar(s, from, end) {
 }
 
 const WS_RE = /\s/;
+const STOP_RE = /[\\`*[]/g;
 
 /**
- * The range [i0, i1) of `s` rendered inline; `linkFn(target)` is a link's href. Plain runs are
- * flushed through escapeHtml whole; constructs recurse on sub-ranges, so nothing is sliced but
- * the runs and the link targets themselves.
+ * The range [i0, i1) of `s` rendered inline; `linkFn(target)` is a link's href. A regex jumps
+ * from construct to construct (the characters \ ` * [), the plain text between them is escaped
+ * a run at a time, and constructs recurse on sub-ranges — nothing is sliced but the runs and
+ * the link targets themselves.
  */
 function inlineRange(s, i0, i1, linkFn) {
   let out = '';
-  let runStart = i0;
   let i = i0;
   while (i < i1) {
-    const c = s[i];
-    if (c === '\\') {
+    STOP_RE.lastIndex = i;
+    const m = STOP_RE.exec(s);
+    const stop = m === null || m.index >= i1 ? i1 : m.index;
+    if (stop > i) {
+      out += escapeHtml(s.slice(i, stop));
+      i = stop;
+      if (i >= i1) break;
+    }
+    const cc = s.charCodeAt(i);
+    if (cc === 92) {
+      // "\"
       if (i + 1 < i1 && ESCAPABLE.has(s[i + 1])) {
-        if (i > runStart) out += escapeHtml(s.slice(runStart, i));
         out += escapeHtml(s[i + 1]);
         i += 2;
-        runStart = i;
-      } else i++;
+      } else {
+        out += '\\';
+        i++;
+      }
       continue;
     }
-    if (c === '`') {
+    if (cc === 96) {
+      // "`"
       const j = s.indexOf('`', i + 1);
       if (j !== -1 && j < i1 && j > i + 1) {
-        if (i > runStart) out += escapeHtml(s.slice(runStart, i));
         out += `<code>${escapeHtml(s.slice(i + 1, j))}</code>`;
         i = j + 1;
-        runStart = i;
-      } else i++;
+      } else {
+        out += '`';
+        i++;
+      }
       continue;
     }
-    if (c === '*') {
+    if (cc === 42) {
+      // "*"
       if (i + 1 < i1 && s[i + 1] === '*') {
         const j = findUnescaped(s, '**', i + 2, i1);
         if (j > i + 2) {
-          if (i > runStart) out += escapeHtml(s.slice(runStart, i));
           out += `<strong>${inlineRange(s, i + 2, j, linkFn)}</strong>`;
           i = j + 2;
-          runStart = i;
-        } else i += 2;
+        } else {
+          out += '**';
+          i += 2;
+        }
         continue;
       }
       const j = findSingleStar(s, i + 1, i1);
       if (j > i + 1) {
-        if (i > runStart) out += escapeHtml(s.slice(runStart, i));
         out += `<em>${inlineRange(s, i + 1, j, linkFn)}</em>`;
         i = j + 1;
-        runStart = i;
-      } else i++;
+      } else {
+        out += '*';
+        i++;
+      }
       continue;
     }
-    if (c === '[') {
-      const k = findUnescaped(s, ']', i + 1, i1);
-      let linked = false;
-      if (k !== -1 && k + 1 < i1 && s[k + 1] === '(') {
-        const m = s.indexOf(')', k + 2);
-        if (m !== -1 && m < i1) {
-          const target = s.slice(k + 2, m);
-          if (target !== '' && !WS_RE.test(target)) {
-            if (i > runStart) out += escapeHtml(s.slice(runStart, i));
-            out += `<a href="${escapeHtml(linkFn(target))}">${inlineRange(s, i + 1, k, linkFn)}</a>`;
-            i = m + 1;
-            runStart = i;
-            linked = true;
-          }
+    // "[" (the only other stop character)
+    const k = findUnescaped(s, ']', i + 1, i1);
+    let linked = false;
+    if (k !== -1 && k + 1 < i1 && s[k + 1] === '(') {
+      const m2 = s.indexOf(')', k + 2);
+      if (m2 !== -1 && m2 < i1) {
+        const target = s.slice(k + 2, m2);
+        if (target !== '' && !WS_RE.test(target)) {
+          out += `<a href="${escapeHtml(linkFn(target))}">${inlineRange(s, i + 1, k, linkFn)}</a>`;
+          i = m2 + 1;
+          linked = true;
         }
       }
-      if (!linked) i++;
-      continue;
     }
-    i++;
+    if (!linked) {
+      out += '[';
+      i++;
+    }
   }
-  if (i1 > runStart) out += escapeHtml(s.slice(runStart, i1));
   return out;
 }
 
@@ -491,7 +528,11 @@ function renderMarkdown(src, linkFn, slugify) {
         if (stripped !== '') parts.push(stripped);
         i++;
       }
-      html += parts.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inlineRange(parts.join('\n'), 0, parts.join('\n').length, linkFn)}</p>\n</blockquote>\n`;
+      if (parts.length === 0) html += '<blockquote>\n</blockquote>\n';
+      else {
+        const joined = parts.join('\n');
+        html += `<blockquote>\n<p>${inlineRange(joined, 0, joined.length, linkFn)}</p>\n</blockquote>\n`;
+      }
       continue;
     }
     const firstBullet = listItemText(line, false);
@@ -555,10 +596,15 @@ const INCLUDE_RE = /^include "([a-z0-9-]+)"$/;
 /** A template that does not parse: its name and why. */
 class TemplateError extends Error {}
 
-/** The path `text` names, split at its dots, or a TemplateError. */
-function pathOf(name, text) {
-  if (!PATH_RE.test(text)) throw new TemplateError(`template "${name}": ${JSON.stringify(text)} is not a path`);
-  return text.split('.');
+/** The path `text` names, split at its dots, or a TemplateError. Paths repeat heavily across a site's templates, so a build memoises them in `cache`. */
+function pathOf(name, text, cache) {
+  let p = cache.get(text);
+  if (p === undefined) {
+    if (!PATH_RE.test(text)) throw new TemplateError(`template "${name}": ${JSON.stringify(text)} is not a path`);
+    p = text.split('.');
+    cache.set(text, p);
+  }
+  return p;
 }
 
 /** Whether s[a..b) is spaces and tabs only. */
@@ -571,7 +617,7 @@ function rangeIsST(s, a, b) {
 }
 
 /** `src`'s tokens: text, {{ }}, {{{ }}} and {% %}, a standalone tag's line taken with it. */
-function tokenizeTemplate(name, src) {
+function tokenizeTemplate(name, src, pathCache) {
   const tokens = [];
   let text = '';
   let i = 0;
@@ -595,7 +641,7 @@ function tokenizeTemplate(name, src) {
       if (close === -1) throw new TemplateError(`template "${name}": a ${raw ? '{{{' : '{{'} is not closed`);
       if (text !== '') tokens.push({ t: 'text', text });
       text = '';
-      tokens.push({ t: raw ? 'raw' : 'var', path: pathOf(name, src.slice(open + (raw ? 3 : 2), close).trim()) });
+      tokens.push({ t: raw ? 'raw' : 'var', path: pathOf(name, src.slice(open + (raw ? 3 : 2), close).trim(), pathCache) });
       i = close + (raw ? 3 : 2);
       continue;
     }
@@ -617,11 +663,11 @@ function tokenizeTemplate(name, src) {
 }
 
 /** `src` parsed into its tree of nodes (a TemplateError when it does not parse). */
-function parseTemplate(name, src) {
+function parseTemplate(name, src, pathCache) {
   const root = { kind: 'root', body: [] };
   const stack = [root];
   let body = root.body;
-  for (const tok of tokenizeTemplate(name, src)) {
+  for (const tok of tokenizeTemplate(name, src, pathCache)) {
     if (tok.t === 'text') body.push({ kind: 'text', text: tok.text });
     else if (tok.t === 'var' || tok.t === 'raw') body.push({ kind: tok.t, path: tok.path });
     else {
@@ -629,12 +675,12 @@ function parseTemplate(name, src) {
       const top = stack[stack.length - 1];
       let m;
       if ((m = FOR_RE.exec(tag)) !== null) {
-        const node = { kind: 'for', name: m[1], path: pathOf(name, m[2]), body: [] };
+        const node = { kind: 'for', name: m[1], path: pathOf(name, m[2], pathCache), body: [] };
         body.push(node);
         stack.push(node);
         body = node.body;
       } else if ((m = IF_RE.exec(tag)) !== null) {
-        const node = { kind: 'if', not: m[1] !== undefined, path: pathOf(name, m[2]), then: [], else: null };
+        const node = { kind: 'if', not: m[1] !== undefined, path: pathOf(name, m[2], pathCache), then: [], else: null };
         body.push(node);
         stack.push(node);
         body = node.then;
@@ -733,10 +779,20 @@ const RESERVED = ['posts', 'tags', 'page'];
 
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
 
-/** The words of a body: its runs of characters other than whitespace. */
+/** The words of a body: its runs of characters other than whitespace, counted in one scan. */
 function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+  let count = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    // The common whitespace inline; the rest of the \s class goes through isWSCode.
+    if (c === 32 || c === 10 || c === 9 || c === 13 || c === 11 || c === 12 || (c >= 0xa0 && isWSCode(c))) inWord = false;
+    else if (!inWord) {
+      inWord = true;
+      count++;
+    }
+  }
+  return count;
 }
 
 /** `rel` from the directory `dir` of a source, or null when it climbs out of the root. */
@@ -760,9 +816,10 @@ export function run(input) {
   // the template left out, as if it were not there.
   const report = [];
   const templates = new Map();
+  const pathCache = new Map();
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
+      templates.set(name, parseTemplate(name, input.templates[name], pathCache));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
@@ -851,7 +908,7 @@ export function run(input) {
   const broken = new Set();
   for (const s of sources) {
     const dir = dirOf(s.path);
-    const linkFn = (target) => {
+    const computeLink = (target) => {
       if (SCHEME_RE.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
       const hash = target.indexOf('#');
       const rel = hash === -1 ? target : target.slice(0, hash);
@@ -864,6 +921,16 @@ export function run(input) {
       }
       broken.add(`broken-link ${s.path} -> ${target}`);
       return target;
+    };
+    // A body's links repeat (and a broken one is reported once), so resolve each target once.
+    const linkCache = new Map();
+    const linkFn = (target) => {
+      let v = linkCache.get(target);
+      if (v === undefined) {
+        v = computeLink(target);
+        linkCache.set(target, v);
+      }
+      return v;
     };
     const md = renderMarkdown(s.body, linkFn, slugify);
     s.html = md.html;
@@ -916,20 +983,26 @@ export function run(input) {
   }
   const tagList = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
-  // The values templates read.
+  // The values templates read. A source's card fields are computed once and shared between the
+  // card the lists show and the page its layout reads.
   const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
-  const cardOf = (s) => ({
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
+  const cardFields = (s) => {
+    if (s._card === undefined) {
+      s._card = {
+        title: s.data.title,
+        url: s.url,
+        date: s.data.date ?? '',
+        date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+        summary: s.data.summary ?? '',
+        excerpt: s.excerpt,
+        reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
+        tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+      };
+    }
+    return s._card;
+  };
   const pageOf = (s) => ({
-    ...cardOf(s),
+    ...cardFields(s),
     slug: s.slug,
     content: s.html,
     toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
@@ -942,7 +1015,7 @@ export function run(input) {
   // a page whose template is missing is not written. Then the static files at their own paths.
   const output = {};
   const cards = new Map();
-  for (const p of posts) cards.set(p, cardOf(p));
+  for (const p of posts) cards.set(p, cardFields(p));
   const site = { title: input.site.title, base_url: base };
   const allTags = tagList.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
